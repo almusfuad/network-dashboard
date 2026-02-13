@@ -2,3 +2,4 @@ streamlit
 pandas
 scapy
 plotly
+psutil>=5.9.0

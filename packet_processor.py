@@ -5,6 +5,101 @@ import pandas as pd
 from scapy.all import sniff, get_if_list
 from scapy.layers.inet import IP, TCP, UDP
 import os
+import psutil
+import socket
+from collections import defaultdict
+
+
+class ConnectionCache:
+    """Cache for mapping network connections to processes.
+    
+    Maintains a periodically updated cache of local IP:port to process mappings
+    to efficiently identify which application generated a packet.
+    """
+    def __init__(self, refresh_interval=2):
+        """Initialize connection cache.
+        
+        Args:
+            refresh_interval: Seconds between cache refreshes (default 2s)
+        """
+        self.cache = {}  # (ip, port, protocol) -> {pid, process_name, exe_path}
+        self.refresh_interval = refresh_interval
+        self.last_refresh = 0
+        self.lock = threading.Lock()
+        self.logger = logger
+        
+    def _refresh_cache(self):
+        """Refresh the connection cache from psutil."""
+        try:
+            new_cache = {}
+            connections = psutil.net_connections(kind='inet')
+            
+            for conn in connections:
+                try:
+                    # Skip connections without local address
+                    if not conn.laddr:
+                        continue
+                    
+                    local_ip = conn.laddr.ip
+                    local_port = conn.laddr.port
+                    
+                    # Determine protocol
+                    if conn.type == socket.SOCK_STREAM:
+                        protocol = 'TCP'
+                    elif conn.type == socket.SOCK_DGRAM:
+                        protocol = 'UDP'
+                    else:
+                        continue
+                    
+                    # Try to get process info
+                    process_info = None
+                    if conn.pid:
+                        try:
+                            proc = psutil.Process(conn.pid)
+                            process_info = {
+                                'pid': conn.pid,
+                                'process_name': proc.name(),
+                                'exe_path': proc.exe()
+                            }
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                            pass
+                    
+                    if process_info:
+                        key = (local_ip, local_port, protocol)
+                        new_cache[key] = process_info
+                
+                except Exception as e:
+                    self.logger.debug(f"Error processing connection: {e}")
+                    continue
+            
+            with self.lock:
+                self.cache = new_cache
+            
+            self.logger.debug(f"Connection cache refreshed with {len(new_cache)} entries")
+        except Exception as e:
+            self.logger.error(f"Error refreshing connection cache: {e}")
+    
+    def get_process_info(self, src_ip, src_port, protocol):
+        """Get process info for a given connection.
+        
+        Args:
+            src_ip: Source IP address
+            src_port: Source port
+            protocol: Protocol (TCP or UDP)
+            
+        Returns:
+            Dict with pid, process_name, exe_path or None if not found
+        """
+        # Refresh cache if needed
+        now = datetime.now().timestamp()
+        if now - self.last_refresh >= self.refresh_interval:
+            self._refresh_cache()
+            self.last_refresh = now
+        
+        # Lookup in cache
+        key = (src_ip, src_port, protocol)
+        with self.lock:
+            return self.cache.get(key)
 
 
 class PacketProcessor:
@@ -18,6 +113,7 @@ class PacketProcessor:
         self.start_time = datetime.now()
         self.packet_count = 0
         self.lock = threading.Lock()
+        self.connection_cache = ConnectionCache(refresh_interval=2)
 
 
 
@@ -30,17 +126,37 @@ class PacketProcessor:
         """Process a single packet and extract relevant information."""
         try:
             if IP in packet:
+                src_ip = packet[IP].src
+                protocol_num = packet[IP].proto
+                protocol_name = self.get_protocol_name(protocol_num)
+                src_port = None
+                dst_port = None
+                
+                # Extract port information
+                if TCP in packet:
+                    src_port = packet[TCP].sport
+                    dst_port = packet[TCP].dport
+                elif UDP in packet:
+                    src_port = packet[UDP].sport
+                    dst_port = packet[UDP].dport
+                
+                # Get process information from cache
+                process_info = None
+                if src_port is not None and protocol_name in ['TCP', 'UDP']:
+                    process_info = self.connection_cache.get_process_info(
+                        src_ip, src_port, protocol_name
+                    )
+                
                 with self.lock:
                     packet_info = {
                         'timestamp': datetime.now(),
-                        'source': packet[IP].src,
+                        'source': src_ip,
                         'destination': packet[IP].dst,
-                        'protocol': self.get_protocol_name(packet[IP].proto),
+                        'protocol': protocol_name,
                         'size': len(packet),
                         'time_relative': (datetime.now() - self.start_time).total_seconds(),
                     }
 
-                
                     # Add TCP-specific information
                     if TCP in packet:
                         packet_info.update({
@@ -54,6 +170,20 @@ class PacketProcessor:
                         packet_info.update({
                             'src_port': packet[UDP].sport,
                             'dst_port': packet[UDP].dport,
+                        })
+                    
+                    # Add process information if found
+                    if process_info:
+                        packet_info.update({
+                            'process_name': process_info.get('process_name', 'Unknown'),
+                            'pid': process_info.get('pid'),
+                            'exe_path': process_info.get('exe_path'),
+                        })
+                    else:
+                        packet_info.update({
+                            'process_name': 'Unknown',
+                            'pid': None,
+                            'exe_path': None,
                         })
 
                     self.packet_data.append(packet_info)
